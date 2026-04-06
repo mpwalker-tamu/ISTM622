@@ -32,30 +32,27 @@ SELECT JSON_OBJECT(
   'customers',
     COALESCE(
       (
-        -- Correlated subquery: collect distinct customers for this product.
-        -- The inner DISTINCT handles the case where a customer ordered the
-        -- same product on multiple separate orders.
         SELECT JSON_ARRAYAGG(
           JSON_OBJECT(
-            'CustomerID',   x.customer_id,
-            'CustomerName', x.customer_name
+            'CustomerID',   c.id,
+            'CustomerName', CONCAT(c.firstName, ' ', c.lastName)
           )
         )
         FROM (
           SELECT DISTINCT
-            c.id                                        AS customer_id,
-            CONCAT(c.firstName, ' ', c.lastName)        AS customer_name
+            c.id,
+            c.firstName,
+            c.lastName
           FROM Orderline ol
-          JOIN `Order`   o ON ol.order_id    = o.id
-          JOIN Customer  c ON o.customer_id  = c.id
-          WHERE ol.product_id = p.id
+          JOIN `Order`  o ON ol.order_id   = o.id
+          JOIN Customer c ON o.customer_id = c.id
+          WHERE ol.product_id = p.id   -- p is now only ONE level up: visible
         ) AS x
       ),
-      JSON_ARRAY()   -- products with no sales get an empty array, not NULL
+      JSON_ARRAY()
     )
 )
 FROM Product p
--- GROUP BY prevents duplicate output lines if Product ever has duplicate rows.
 GROUP BY p.id, p.currentPrice, p.name
 INTO OUTFILE '/var/lib/mysql-files/prod.json'
 LINES TERMINATED BY '\n';
