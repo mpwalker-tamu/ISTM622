@@ -1,10 +1,5 @@
 USE POS;
 
-SYSTEM rm -f /var/lib/mysql-files/prod.json;
-SYSTEM rm -f /var/lib/mysql-files/cust.json;
-SYSTEM rm -f /var/lib/mysql-files/custom1.json;
-SYSTEM rm -f /var/lib/mysql-files/custom2.json;
-
 SELECT JSON_OBJECT(
   'ProductID', p.id,
   'currentPrice', p.currentPrice,
