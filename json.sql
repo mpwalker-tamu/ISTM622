@@ -1,291 +1,363 @@
 -- ============================================================================
--- json_export_fixed.sql
--- JSON export queries for the POS database
+-- json_export_mariadb.sql
+-- JSON export queries for the POS database — MariaDB compatible
 --
 -- Outputs:
 --   /var/lib/mysql-files/prod.json     (Query 1 — product + buyer list)
 --   /var/lib/mysql-files/cust.json     (Query 2 — customer + order history)
---   /var/lib/mysql-files/custom1.json  (Query 3 — product + buyer regions)
---   /var/lib/mysql-files/custom2.json  (Query 4 — customer + lifetime metrics)
+--   /var/lib/mysql-files/custom1.json  (Query 3 — regional delivery manifest)
+--   /var/lib/mysql-files/custom2.json  (Query 4 — product sales & inventory report)
 --
--- NOTE: MySQL's INTO OUTFILE will error if the output file already exists.
--- Delete the four files from /var/lib/mysql-files/ before re-running this script.
+-- MariaDB compatibility note:
+--   MariaDB does not resolve outer-query table references inside correlated
+--   subqueries as permissively as MySQL 8.  To avoid "Unknown column" errors,
+--   ALL correlated subqueries have been replaced with pre-aggregated derived
+--   tables that are LEFT JOINed back to the main query.  The engine sees a
+--   single flat join rather than nested scope lookups.
+--
+-- NOTE: INTO OUTFILE will error if the target file already exists.
+--   Delete all four files from /var/lib/mysql-files/ before re-running.
 -- ============================================================================
 
 USE POS;
 
 -- ============================================================================
 -- Query 1 — prod.json
+-- Business case: Product catalog view — which customers have bought each item.
 -- One JSON object per product line.
--- Each object lists the product's ID, current price, name, and a deduplicated
--- array of every customer who has ever purchased it (or an empty array).
+-- Fields: ProductID, currentPrice, productName,
+--         customers[ { CustomerID, CustomerName } ]
 --
--- FIX: Added GROUP BY p.id, p.currentPrice, p.name on the outer query.
---      Without it, any future duplicate rows in Product would produce duplicate
---      output lines with no error.  Grouping also makes the aggregation intent
---      explicit even though the correlated subquery already handles dedup.
+-- Strategy: pre-aggregate every product→customer relationship into one derived
+-- table (buyer_agg), then LEFT JOIN it to Product so unsold products receive
+-- an empty array via COALESCE.
 -- ============================================================================
 SELECT JSON_OBJECT(
   'ProductID',    p.id,
   'currentPrice', p.currentPrice,
   'productName',  p.name,
-  'customers',
-    COALESCE(
-      (
-        SELECT JSON_ARRAYAGG(
-          JSON_OBJECT(
-            'CustomerID',   c.id,
-            'CustomerName', CONCAT(c.firstName, ' ', c.lastName)
-          )
-        )
-        FROM (
-          SELECT DISTINCT
-            c.id,
-            c.firstName,
-            c.lastName
-          FROM Orderline ol
-          JOIN `Order`  o ON ol.order_id   = o.id
-          JOIN Customer c ON o.customer_id = c.id
-          WHERE ol.product_id = p.id   -- p is now only ONE level up: visible
-        ) AS x
-      ),
-      JSON_ARRAY()
-    )
+  'customers',    COALESCE(buyer_agg.customer_list, JSON_ARRAY())
 )
 FROM Product p
-GROUP BY p.id, p.currentPrice, p.name
+LEFT JOIN (
+  -- Step 1: get one distinct (product, customer) pair per row.
+  -- DISTINCT handles customers who ordered the same product multiple times.
+  -- Step 2: group by product and collapse into a JSON array.
+  SELECT
+    x.product_id,
+    JSON_ARRAYAGG(
+      JSON_OBJECT(
+        'CustomerID',   x.customer_id,
+        'CustomerName', x.customer_name
+      )
+      ORDER BY x.customer_id   -- consistent array order
+    ) AS customer_list
+  FROM (
+    SELECT DISTINCT
+      ol.product_id,
+      c.id                                 AS customer_id,
+      CONCAT(c.firstName, ' ', c.lastName) AS customer_name
+    FROM Orderline ol
+    JOIN `Order`  o ON ol.order_id   = o.id
+    JOIN Customer c ON o.customer_id = c.id
+  ) AS x
+  GROUP BY x.product_id
+) AS buyer_agg ON buyer_agg.product_id = p.id
+ORDER BY p.id
 INTO OUTFILE '/var/lib/mysql-files/prod.json'
 LINES TERMINATED BY '\n';
 
 
 -- ============================================================================
 -- Query 2 — cust.json
+-- Business case: Customer order history with full mailing address formatting.
 -- One JSON object per customer line.
--- Each object includes mailing-address fields and a nested array of every
--- order placed by that customer, with each order containing its own item array.
+-- Fields: CustomerID, customer_name, printed_address_1, printed_address_2,
+--         orders[ { Order Total, Order Date, Shipping Date,
+--                   Items[ { ProductID, Quantity, ProductName } ] } ]
 --
--- FIXES applied vs. the original:
+-- Address formatting rules per spec:
+--   printed_address_1 — address2 is appended as "# <address2>" only when
+--                       address2 is non-NULL and non-blank.
+--   printed_address_2 — "City, State   Zip" (comma+space, three spaces before zip)
 --
---   1. Removed the three dead CTEs (item_json, order_json, customer_orders).
---      They were never referenced in the final SELECT and contained a logic
---      error: the join condition inside customer_orders was a tautology
---      (col IS NOT NULL OR col IS NULL is always TRUE), which would have
---      caused a full cross-join and massively duplicated rows had the CTEs
---      ever been wired up.
---
---   2. The ORDER BY ord.id that appeared inside the derived table feeding
---      JSON_ARRAYAGG is unreliable — MySQL does not guarantee that an ORDER BY
---      inside a subquery is preserved by an outer aggregation.  Ordering is now
---      expressed inside JSON_ARRAYAGG itself via the ORDER BY clause supported
---      in MySQL 8.0+, which is the only guaranteed way to control array order.
+-- Two levels of nesting require two pre-aggregated derived tables:
+--   item_agg  — collapses orderline rows into a JSON items array per order
+--   order_agg — collapses orders (with their item arrays) into a JSON orders
+--               array per customer
+-- Both are LEFT JOINed so customers with no orders still appear.
 -- ============================================================================
 SELECT JSON_OBJECT(
-  'CustomerID', c.id,
-  'customer_name', CONCAT(c.firstName, ' ', c.lastName),
-  -- printed_address_1: omit the '#' separator when address2 is absent/blank
+  'CustomerID',      c.id,
+  'customer_name',   CONCAT(c.firstName, ' ', c.lastName),
+  -- printed_address_1: omit the '#' separator when address2 is absent or blank
   'printed_address_1',
     CASE
       WHEN c.address2 IS NULL OR TRIM(c.address2) = '' THEN c.address1
       ELSE CONCAT(c.address1, ' #', c.address2)
     END,
-  -- printed_address_2: City, State   ZIP  (zip is ZEROFILL so LPAD is redundant
-  --   but kept for readability / forward-compatibility with schema changes)
+  -- printed_address_2: "City, State   Zip"
+  -- Zip is DECIMAL ZEROFILL so LPAD is technically redundant, but kept for
+  -- readability and resilience against future schema changes.
   'printed_address_2', CONCAT(ci.city, ', ', ci.state, '   ', LPAD(ci.zip, 5, '0')),
-  'orders',
-    COALESCE(
-      (
-        -- Derive one row per order, then aggregate into a JSON array.
-        -- JSON_ARRAYAGG ORDER BY (MySQL 8.0+) is used here instead of an
-        -- ORDER BY on the derived table, which is not guaranteed to be
-        -- respected by the outer aggregation.
-        SELECT JSON_ARRAYAGG(
-          JSON_OBJECT(
-            'Order Total',   o.order_total,
-            'Order Date',    o.order_date,
-            'Shipping Date', o.shipping_date,
-            'Items',         o.items
-          )
-          ORDER BY o.order_id   -- reliable ordering inside the JSON array
-        )
-        FROM (
-          -- One row per order: compute the total and build the items sub-array.
-          SELECT
-            ord.id                                         AS order_id,
-            ROUND(SUM(p.currentPrice * ol.quantity), 2)    AS order_total,
-            ord.datePlaced                                 AS order_date,
-            ord.dateShipped                                AS shipping_date,
-            -- Nested correlated subquery builds the items array for this order.
-            (
-              SELECT JSON_ARRAYAGG(
-                JSON_OBJECT(
-                  'ProductID',   p2.id,
-                  'Quantity',    ol2.quantity,
-                  'ProductName', p2.name
-                )
-              )
-              FROM Orderline ol2
-              JOIN Product   p2 ON ol2.product_id = p2.id
-              WHERE ol2.order_id = ord.id
-            ) AS items
-          FROM `Order`  ord
-          JOIN Orderline ol ON ord.id          = ol.order_id
-          JOIN Product    p ON ol.product_id   = p.id
-          WHERE ord.customer_id = c.id
-          GROUP BY ord.id, ord.datePlaced, ord.dateShipped
-        ) o
-      ),
-      JSON_ARRAY()   -- customers with no orders get an empty array, not NULL
-    )
+  'orders', COALESCE(order_agg.order_list, JSON_ARRAY())
 )
 FROM Customer c
 JOIN City ci ON c.zip = ci.zip
+LEFT JOIN (
+  -- order_agg: one row per customer containing their full orders JSON array.
+  SELECT
+    ord_totals.customer_id,
+    JSON_ARRAYAGG(
+      JSON_OBJECT(
+        'Order Total',   ord_totals.order_total,
+        'Order Date',    ord_totals.order_date,
+        'Shipping Date', ord_totals.shipping_date,
+        'Items',         COALESCE(item_agg.item_list, JSON_ARRAY())
+      )
+      ORDER BY ord_totals.order_id   -- consistent order of orders in array
+    ) AS order_list
+  FROM (
+    -- ord_totals: one row per order with its total and date fields.
+    SELECT
+      ord.id                                        AS order_id,
+      ord.customer_id,
+      ROUND(SUM(p.currentPrice * ol.quantity), 2)   AS order_total,
+      ord.datePlaced                                AS order_date,
+      ord.dateShipped                               AS shipping_date
+    FROM `Order`   ord
+    JOIN Orderline ol ON ord.id          = ol.order_id
+    JOIN Product    p ON ol.product_id   = p.id
+    GROUP BY ord.id, ord.customer_id, ord.datePlaced, ord.dateShipped
+  ) AS ord_totals
+  LEFT JOIN (
+    -- item_agg: one row per order containing its items JSON array.
+    -- Pre-aggregated here so ord_totals can LEFT JOIN without a correlated ref.
+    SELECT
+      ol.order_id,
+      JSON_ARRAYAGG(
+        JSON_OBJECT(
+          'ProductID',   p.id,
+          'Quantity',    ol.quantity,
+          'ProductName', p.name
+        )
+      ) AS item_list
+    FROM Orderline ol
+    JOIN Product   p ON ol.product_id = p.id
+    GROUP BY ol.order_id
+  ) AS item_agg ON item_agg.order_id = ord_totals.order_id
+  GROUP BY ord_totals.customer_id
+) AS order_agg ON order_agg.customer_id = c.id
+ORDER BY c.id
 INTO OUTFILE '/var/lib/mysql-files/cust.json'
 LINES TERMINATED BY '\n';
 
 
 -- ============================================================================
 -- Query 3 — custom1.json
--- One JSON object per product line.
--- Extends Query 1 by adding a sales_summary sub-object (distinct order count
--- and total units sold) and enriching the buyer list with city/state data.
+-- Business case: Regional Delivery Manifest
 --
--- No logic bugs were present; no structural changes made.
--- The ORDER BY c.id inside the DISTINCT subquery is cosmetic — actual array
--- ordering is controlled by the storage engine for JSON_ARRAYAGG.  If
--- deterministic order matters here, migrate to JSON_ARRAYAGG(...ORDER BY c.id)
--- the same way Query 2 was fixed.
+-- A furniture manufacturer ships large items by region.  The warehouse and
+-- logistics team needs a manifest grouped by state so they can plan truck
+-- routes and confirm delivery addresses before dispatch.
+--
+-- Structure (one object per state):
+--   state
+--   total_shipments      — count of distinct orders shipping to this state
+--   orders[              — every order shipping to this state
+--     {
+--       OrderID
+--       OrderDate
+--       ShippingDate     (NULL = not yet shipped / still on the floor)
+--       ShipTo {         — full delivery address for the driver
+--         CustomerName
+--         address_line_1
+--         address_line_2   ("City, State   Zip")
+--       }
+--       furniture_items[ — what is actually on the truck for this order
+--         { ProductID, ProductName, Quantity }
+--       ]
+--     }
+--   ]
+--
+-- Strategy:
+--   item_agg  — items array per order (no outer reference needed)
+--   order_agg — order objects grouped by state, joined with item_agg
 -- ============================================================================
 SELECT JSON_OBJECT(
-  'ProductID',        p.id,
-  'productName',      p.name,
-  'currentPrice',     p.currentPrice,
-  'availableQuantity', p.availableQuantity,
-  'sales_summary', JSON_OBJECT(
-    'total_orders', COALESCE((
-      SELECT COUNT(DISTINCT ol.order_id)
-      FROM Orderline ol
-      WHERE ol.product_id = p.id
-    ), 0),
-    'total_units_sold', COALESCE((
-      SELECT SUM(ol.quantity)
-      FROM Orderline ol
-      WHERE ol.product_id = p.id
-    ), 0)
-  ),
-  'buyer_regions',
-    COALESCE(
-      (
-        -- Collect distinct customers (with location) who purchased this product.
-        SELECT JSON_ARRAYAGG(
-          JSON_OBJECT(
-            'CustomerID',   x.customer_id,
-            'CustomerName', x.customer_name,
-            'City',         x.city,
-            'State',        x.state
-          )
-        )
-        FROM (
-          SELECT DISTINCT
-            c.id                                     AS customer_id,
-            CONCAT(c.firstName, ' ', c.lastName)     AS customer_name,
-            ci.city,
-            ci.state
-          FROM Orderline ol
-          JOIN `Order`   o  ON ol.order_id   = o.id
-          JOIN Customer  c  ON o.customer_id = c.id
-          JOIN City      ci ON c.zip         = ci.zip
-          WHERE ol.product_id = p.id
-          ORDER BY c.id   -- ordering inside a subquery; see note in Query 2
-        ) x
-      ),
-      JSON_ARRAY()
-    )
+  'state',           ship_info.state,
+  'total_shipments', COUNT(DISTINCT ship_info.order_id),
+  'orders',          COALESCE(order_agg.order_list, JSON_ARRAY())
 )
-FROM Product p
+FROM (
+  -- ship_info: one row per order with state and formatted address fields.
+  -- Derived here so order_agg can join on state without a correlated reference.
+  SELECT
+    o.id                                          AS order_id,
+    o.datePlaced                                  AS order_date,
+    o.dateShipped                                 AS shipping_date,
+    ci.state,
+    CONCAT(c.firstName, ' ', c.lastName)          AS customer_name,
+    CASE
+      WHEN c.address2 IS NULL OR TRIM(c.address2) = '' THEN c.address1
+      ELSE CONCAT(c.address1, ' #', c.address2)
+    END                                           AS address_line_1,
+    CONCAT(ci.city, ', ', ci.state, '   ', LPAD(ci.zip, 5, '0'))
+                                                  AS address_line_2
+  FROM `Order`   o
+  JOIN Customer  c  ON o.customer_id = c.id
+  JOIN City      ci ON c.zip         = ci.zip
+) AS ship_info
+LEFT JOIN (
+  -- order_agg: one row per state containing all order objects for that state.
+  SELECT
+    si.state,
+    JSON_ARRAYAGG(
+      JSON_OBJECT(
+        'OrderID',      si.order_id,
+        'OrderDate',    si.order_date,
+        'ShippingDate', si.shipping_date,
+        'ShipTo', JSON_OBJECT(
+          'CustomerName',   si.customer_name,
+          'address_line_1', si.address_line_1,
+          'address_line_2', si.address_line_2
+        ),
+        'furniture_items', COALESCE(item_agg.item_list, JSON_ARRAY())
+      )
+      ORDER BY si.order_id
+    ) AS order_list
+  FROM (
+    -- Repeat the same ship_info derivation so order_agg has its own scope.
+    -- MariaDB does not allow a derived table in the outer FROM to be referenced
+    -- inside a LEFT JOIN subquery, so we define it again here.
+    SELECT
+      o.id                                          AS order_id,
+      o.datePlaced                                  AS order_date,
+      o.dateShipped                                 AS shipping_date,
+      ci.state,
+      CONCAT(c.firstName, ' ', c.lastName)          AS customer_name,
+      CASE
+        WHEN c.address2 IS NULL OR TRIM(c.address2) = '' THEN c.address1
+        ELSE CONCAT(c.address1, ' #', c.address2)
+      END                                           AS address_line_1,
+      CONCAT(ci.city, ', ', ci.state, '   ', LPAD(ci.zip, 5, '0'))
+                                                    AS address_line_2
+    FROM `Order`   o
+    JOIN Customer  c  ON o.customer_id = c.id
+    JOIN City      ci ON c.zip         = ci.zip
+  ) AS si
+  LEFT JOIN (
+    -- item_agg: furniture items array per order.
+    SELECT
+      ol.order_id,
+      JSON_ARRAYAGG(
+        JSON_OBJECT(
+          'ProductID',   p.id,
+          'ProductName', p.name,
+          'Quantity',    ol.quantity
+        )
+      ) AS item_list
+    FROM Orderline ol
+    JOIN Product   p ON ol.product_id = p.id
+    GROUP BY ol.order_id
+  ) AS item_agg ON item_agg.order_id = si.order_id
+  GROUP BY si.state
+) AS order_agg ON order_agg.state = ship_info.state
+GROUP BY ship_info.state, order_agg.order_list
+ORDER BY ship_info.state
 INTO OUTFILE '/var/lib/mysql-files/custom1.json'
 LINES TERMINATED BY '\n';
 
 
 -- ============================================================================
 -- Query 4 — custom2.json
--- One JSON object per customer line.
--- Extends Query 2 by adding email, a region sub-object, and lifetime_metrics
--- (total orders, lifetime spend, total items purchased).
+-- Business case: Product Sales & Inventory Report
 --
--- FIX: The GROUP BY inside the orders correlated subquery was "GROUP BY
---      ord.customer_id", which collapsed ALL of a customer's orders into a
---      single row.  This meant every customer received exactly one entry in
---      their orders array regardless of how many orders they actually had.
---      Corrected to "GROUP BY ord.id, ord.datePlaced, ord.dateShipped" so
---      each order produces its own row before aggregation.
+-- A furniture manufacturer's product manager needs to know, for each item in
+-- the catalog, how it is selling and who is buying it — so they can make
+-- restocking and pricing decisions.
+--
+-- Structure (one object per product):
+--   ProductID
+--   productName
+--   currentPrice
+--   availableQuantity    — current stock on hand
+--   revenue_summary {
+--     total_orders       — how many distinct orders included this product
+--     total_units_sold   — sum of all quantities sold across all orders
+--     total_revenue      — total revenue generated (price × qty, all orders)
+--   }
+--   order_history[       — every order that included this product
+--     {
+--       OrderID
+--       OrderDate
+--       ShippingDate
+--       QuantityOrdered  — units of THIS product in this specific order
+--       CustomerID
+--       CustomerName
+--     }
+--   ]
+--
+-- Strategy:
+--   rev      — revenue summary figures per product in a single scan
+--   hist_agg — order history array per product
 -- ============================================================================
 SELECT JSON_OBJECT(
-  'CustomerID',   c.id,
-  'customer_name', CONCAT(c.firstName, ' ', c.lastName),
-  'email',        c.email,
-  'region', JSON_OBJECT(
-    'city',  ci.city,
-    'state', ci.state,
-    'zip',   LPAD(ci.zip, 5, '0')
+  'ProductID',         p.id,
+  'productName',       p.name,
+  'currentPrice',      p.currentPrice,
+  'availableQuantity', p.availableQuantity,
+  'revenue_summary', JSON_OBJECT(
+    'total_orders',     COALESCE(rev.total_orders,     0),
+    'total_units_sold', COALESCE(rev.total_units_sold, 0),
+    'total_revenue',    COALESCE(rev.total_revenue,    0)
   ),
-  'lifetime_metrics', JSON_OBJECT(
-    'total_orders', COALESCE((
-      SELECT COUNT(*)
-      FROM `Order` o
-      WHERE o.customer_id = c.id
-    ), 0),
-    'lifetime_value', COALESCE((
-      SELECT ROUND(SUM(p.currentPrice * ol.quantity), 2)
-      FROM `Order`   o
-      JOIN Orderline ol ON o.id          = ol.order_id
-      JOIN Product    p ON ol.product_id = p.id
-      WHERE o.customer_id = c.id
-    ), 0),
-    'total_items_purchased', COALESCE((
-      SELECT SUM(ol.quantity)
-      FROM `Order`   o
-      JOIN Orderline ol ON o.id = ol.order_id
-      WHERE o.customer_id = c.id
-    ), 0)
-  ),
-  'orders',
-    COALESCE(
-      (
-        SELECT JSON_ARRAYAGG(
-          JSON_OBJECT(
-            'OrderID',      ord.id,
-            'OrderDate',    ord.datePlaced,
-            'ShippingDate', ord.dateShipped,
-            'OrderTotal',   ROUND(SUM(p.currentPrice * ol.quantity), 2),
-            'Items',
-              (
-                SELECT JSON_ARRAYAGG(
-                  JSON_OBJECT(
-                    'ProductID',   p2.id,
-                    'ProductName', p2.name,
-                    'Quantity',    ol2.quantity
-                  )
-                )
-                FROM Orderline ol2
-                JOIN Product   p2 ON ol2.product_id = p2.id
-                WHERE ol2.order_id = ord.id
-              )
-          )
-        )
-        FROM `Order`   ord
-        JOIN Orderline ol ON ord.id          = ol.order_id
-        JOIN Product    p ON ol.product_id   = p.id
-        WHERE ord.customer_id = c.id
-        -- FIX: was "GROUP BY ord.customer_id" — that collapsed every order for
-        --      a customer into one row, so JSON_ARRAYAGG only ever produced a
-        --      single-element array.  Must group by order identity fields so
-        --      each order becomes its own row before aggregation.
-        GROUP BY ord.id, ord.datePlaced, ord.dateShipped
-      ),
-      JSON_ARRAY()   -- customers with no orders get an empty array, not NULL
-    )
+  'order_history', COALESCE(hist_agg.order_list, JSON_ARRAY())
 )
-FROM Customer c
-JOIN City ci ON c.zip = ci.zip
+FROM Product p
+LEFT JOIN (
+  -- rev: summary figures for each product in a single scan.
+  SELECT
+    ol.product_id,
+    COUNT(DISTINCT ol.order_id)                 AS total_orders,
+    SUM(ol.quantity)                            AS total_units_sold,
+    ROUND(SUM(p.currentPrice * ol.quantity), 2) AS total_revenue
+  FROM Orderline ol
+  JOIN Product p ON ol.product_id = p.id
+  GROUP BY ol.product_id
+) AS rev ON rev.product_id = p.id
+LEFT JOIN (
+  -- hist_agg: one row per product containing the full order history array.
+  -- Each entry records who ordered this product, when, and how many units.
+  SELECT
+    x.product_id,
+    JSON_ARRAYAGG(
+      JSON_OBJECT(
+        'OrderID',         x.order_id,
+        'OrderDate',       x.order_date,
+        'ShippingDate',    x.shipping_date,
+        'QuantityOrdered', x.quantity,
+        'CustomerID',      x.customer_id,
+        'CustomerName',    x.customer_name
+      )
+      ORDER BY x.order_id
+    ) AS order_list
+  FROM (
+    -- One row per (product, order) pair with customer and date context.
+    SELECT
+      ol.product_id,
+      o.id                                         AS order_id,
+      o.datePlaced                                 AS order_date,
+      o.dateShipped                                AS shipping_date,
+      ol.quantity,
+      c.id                                         AS customer_id,
+      CONCAT(c.firstName, ' ', c.lastName)         AS customer_name
+    FROM Orderline ol
+    JOIN `Order`  o ON ol.order_id   = o.id
+    JOIN Customer c ON o.customer_id = c.id
+  ) AS x
+  GROUP BY x.product_id
+) AS hist_agg ON hist_agg.product_id = p.id
+ORDER BY p.id
 INTO OUTFILE '/var/lib/mysql-files/custom2.json'
 LINES TERMINATED BY '\n';
