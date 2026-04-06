@@ -9,8 +9,8 @@ SELECT JSON_OBJECT(
       (
         SELECT JSON_ARRAYAGG(
           JSON_OBJECT(
-            'CustomerID', t.customer_id,
-            'CustomerName', t.customer_name
+            'CustomerID', x.customer_id,
+            'CustomerName', x.customer_name
           )
         )
         FROM (
@@ -21,8 +21,7 @@ SELECT JSON_OBJECT(
           JOIN `Order` o ON ol.order_id = o.id
           JOIN Customer c ON o.customer_id = c.id
           WHERE ol.product_id = p.id
-          ORDER BY c.id
-        ) t
+        ) AS x
       ),
       JSON_ARRAY()
     )
