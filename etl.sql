@@ -1,7 +1,30 @@
+-- ============================================================================
+-- POS database build + load script
+-- ============================================================================
+-- ETL Workflow
+--   1. Recreate the POS database
+--   2. Create normalized tables (City, Customer, Product, Order, Orderline)
+--   3. Create staging tables that match the CSV file structure
+--   4. Load raw CSV data using LOAD DATA LOCAL INFILE
+--   5. Transform and insert cleaned data into the normalized tables
+--   6. Drop staging tables after successful transformation
+--
+-- After the ETL load completes, the script also creates:
+--   1. a view (v_ProductBuyers)
+--   2. a simulated materialized view table (mv_ProductBuyers)
+--   3. triggers that keep the materialized view synchronized
+-- ============================================================================
+
+-- Create tables in the POS database
 DROP DATABASE IF EXISTS POS;
 CREATE DATABASE POS;
 USE POS;
 
+-- ============================================================================
+-- Core tables
+-- ============================================================================
+
+-- City Table
 CREATE TABLE City (
   zip DECIMAL(5,0) ZEROFILL NOT NULL,
   city VARCHAR(32) NOT NULL,
@@ -9,6 +32,7 @@ CREATE TABLE City (
   PRIMARY KEY (zip)
 ) ENGINE=InnoDB;
 
+-- Customer Table
 CREATE TABLE Customer (
   id SERIAL,
   firstName VARCHAR(32) NOT NULL,
@@ -26,6 +50,7 @@ CREATE TABLE Customer (
     ON DELETE RESTRICT
 ) ENGINE=InnoDB;
 
+-- Product Table
 CREATE TABLE Product (
   id SERIAL,
   name VARCHAR(128) NOT NULL,
@@ -34,6 +59,7 @@ CREATE TABLE Product (
   PRIMARY KEY (id)
 ) ENGINE=InnoDB;
 
+-- Order Table (reserved word, so use backticks)
 CREATE TABLE `Order` (
   id SERIAL,
   datePlaced DATE NOT NULL,
@@ -47,6 +73,7 @@ CREATE TABLE `Order` (
     ON DELETE RESTRICT
 ) ENGINE=InnoDB;
 
+-- Orderline Table (composite PK)
 CREATE TABLE Orderline (
   order_id BIGINT UNSIGNED NOT NULL,
   product_id BIGINT UNSIGNED NOT NULL,
@@ -62,6 +89,7 @@ CREATE TABLE Orderline (
     ON DELETE RESTRICT
 ) ENGINE=InnoDB;
 
+-- PriceHistory Table
 CREATE TABLE PriceHistory (
   id SERIAL,
   oldPrice DECIMAL(6,2) NOT NULL,
@@ -76,22 +104,27 @@ CREATE TABLE PriceHistory (
     ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
+-- ============================================================================
+-- Staging tables (raw import)
+-- ============================================================================
+-- These tables match the CSV columns closely to simplify ingestion.
+-- They are dropped at the end of the script.
 CREATE TABLE stg_customers (
-  ID VARCHAR(32),
-  FN VARCHAR(64),
-  LN VARCHAR(64),
-  CT VARCHAR(64),
-  ST VARCHAR(16),
-  ZP VARCHAR(16),
-  S1 VARCHAR(255),
-  S2 VARCHAR(255),
-  EM VARCHAR(255),
-  BD VARCHAR(64)
+  ID  VARCHAR(32),
+  FN  VARCHAR(64),
+  LN  VARCHAR(64),
+  CT  VARCHAR(64),
+  ST  VARCHAR(16),
+  ZP  VARCHAR(16),
+  S1  VARCHAR(255),
+  S2  VARCHAR(255),
+  EM  VARCHAR(255),
+  BD  VARCHAR(64)
 ) ENGINE=InnoDB;
 
 CREATE TABLE stg_orders (
-  OID VARCHAR(32),
-  CID VARCHAR(32),
+  OID     VARCHAR(32),
+  CID     VARCHAR(32),
   Ordered VARCHAR(64),
   Shipped VARCHAR(64)
 ) ENGINE=InnoDB;
@@ -102,12 +135,16 @@ CREATE TABLE stg_orderlines (
 ) ENGINE=InnoDB;
 
 CREATE TABLE stg_products (
-  ID VARCHAR(32),
-  Name VARCHAR(255),
+  ID    VARCHAR(32),
+  Name  VARCHAR(255),
   Price VARCHAR(64),
-  QOH VARCHAR(32)
+  QOH   VARCHAR(32)
 ) ENGINE=InnoDB;
 
+-- ============================================================================
+-- Load CSVs (LOCAL INFILE reads from client machine)
+-- ============================================================================
+-- Relax a few sql_mode flags so invalid/zero dates in source data don't fail loads.
 SET SESSION sql_mode = REPLACE(@@sql_mode, 'STRICT_TRANS_TABLES', '');
 SET SESSION sql_mode = REPLACE(@@sql_mode, 'NO_ZERO_DATE', '');
 SET SESSION sql_mode = REPLACE(@@sql_mode, 'NO_ZERO_IN_DATE', '');
@@ -141,6 +178,11 @@ IGNORE 1 LINES
 (ID,Name,Price,@qoh_raw)
 SET QOH = @qoh_raw;
 
+-- ============================================================================
+-- Transform + Load into final tables
+-- ============================================================================
+
+-- City (distinct zips from customers)
 INSERT INTO City (zip, city, state)
 SELECT DISTINCT
   CAST(NULLIF(TRIM(ZP), '') AS DECIMAL(5,0)) AS zip,
@@ -149,6 +191,7 @@ SELECT DISTINCT
 FROM stg_customers
 WHERE NULLIF(TRIM(ZP), '') IS NOT NULL;
 
+-- Customer
 INSERT INTO Customer (id, firstName, lastName, email, address1, address2, phone, birthdate, zip)
 SELECT
   CAST(TRIM(ID) AS UNSIGNED) AS id,
@@ -157,7 +200,7 @@ SELECT
   TRIM(EM) AS email,
   TRIM(S1) AS address1,
   NULLIF(TRIM(S2), '') AS address2,
-  NULL AS phone,
+  NULL AS phone, -- not present in source file
   CASE
     WHEN NULLIF(TRIM(BD), '') IS NULL THEN NULL
     WHEN TRIM(BD) IN ('0000-00-00','0000-00-00 00:00:00') THEN NULL
@@ -170,6 +213,7 @@ SELECT
   CAST(NULLIF(TRIM(ZP), '') AS DECIMAL(5,0)) AS zip
 FROM stg_customers;
 
+-- Product (clean price)
 INSERT INTO Product (id, name, currentPrice, availableQuantity)
 SELECT
   CAST(TRIM(ID) AS UNSIGNED) AS id,
@@ -178,6 +222,7 @@ SELECT
   CAST(NULLIF(TRIM(QOH), '') AS SIGNED) AS availableQuantity
 FROM stg_products;
 
+-- Order (convert datetime text -> DATE)
 INSERT INTO `Order` (id, datePlaced, dateShipped, customer_id)
 SELECT
   CAST(TRIM(OID) AS UNSIGNED) AS id,
@@ -209,6 +254,7 @@ SELECT
   CAST(TRIM(CID) AS UNSIGNED) AS customer_id
 FROM stg_orders;
 
+-- Orderline (denormalized -> normalized with quantity)
 INSERT INTO Orderline (order_id, product_id, quantity)
 SELECT
   CAST(TRIM(OID) AS UNSIGNED) AS order_id,
@@ -219,6 +265,11 @@ GROUP BY
   CAST(TRIM(OID) AS UNSIGNED),
   CAST(TRIM(PID) AS UNSIGNED);
 
+-- PriceHistory: no source CSV provided.
+
+-- ============================================================================
+-- Cleanup (staging tables must be dropped)
+-- ============================================================================
 DROP TABLE IF EXISTS stg_customers;
 DROP TABLE IF EXISTS stg_orders;
 DROP TABLE IF EXISTS stg_orderlines;
