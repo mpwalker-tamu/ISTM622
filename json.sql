@@ -155,48 +155,56 @@ LINES TERMINATED BY '\n';
 
 -- ============================================================================
 -- Query 3 — custom1.json
--- Business case: Regional Delivery Manifest
+-- Business case: Pending Shipment Manifest
 --
--- A furniture manufacturer ships large items by region.  The warehouse and
--- logistics team needs a manifest grouped by state so they can plan truck
--- routes and confirm delivery addresses before dispatch.
+-- The warehouse team needs a pull list for every order that has not yet
+-- shipped (dateShipped IS NULL).  Each record gives the delivery address so
+-- the shipping label can be printed, and a nested parts list so the picker
+-- knows exactly what to pull from the floor for that order.
 --
--- Structure (one object per state):
---   state
---   total_shipments      — count of distinct orders shipping to this state
---   orders[              — every order shipping to this state
+-- Orders are sorted oldest-first so the most overdue ship first.
+--
+-- Structure (one object per unshipped order):
+--   OrderID
+--   OrderDate
+--   ShipTo {              — delivery address for the shipping label
+--     CustomerID
+--     CustomerName
+--     address_line_1      — street address (with unit # if address2 present)
+--     address_line_2      — "City, State   Zip"
+--   }
+--   pull_list[            — parts the picker needs to stage for this order
 --     {
---       OrderID
---       OrderDate
---       ShippingDate     (NULL = not yet shipped / still on the floor)
---       ShipTo {         — full delivery address for the driver
---         CustomerName
---         address_line_1
---         address_line_2   ("City, State   Zip")
---       }
---       furniture_items[ — what is actually on the truck for this order
---         { ProductID, ProductName, Quantity }
---       ]
+--       ProductID
+--       ProductName
+--       Quantity
 --     }
 --   ]
 --
 -- Strategy:
---   item_agg  — items array per order (no outer reference needed)
---   order_agg — order objects grouped by state, joined with item_agg
+--   Filter to unshipped orders inside a derived table (pending) — keeps the
+--   WHERE off the outer query so MariaDB's join syntax stays clean.
+--   item_agg — pull list array pre-aggregated per order, then LEFT JOINed.
 -- ============================================================================
 SELECT JSON_OBJECT(
-  'state',           ship_info.state,
-  'total_shipments', COUNT(DISTINCT ship_info.order_id),
-  'orders',          COALESCE(order_agg.order_list, JSON_ARRAY())
+  'OrderID',   pending.order_id,
+  'OrderDate', pending.order_date,
+  'ShipTo', JSON_OBJECT(
+    'CustomerID',     pending.customer_id,
+    'CustomerName',   pending.customer_name,
+    'address_line_1', pending.address_line_1,
+    'address_line_2', pending.address_line_2
+  ),
+  'pull_list', COALESCE(item_agg.pull_list, JSON_ARRAY())
 )
 FROM (
-  -- ship_info: one row per order with state and formatted address fields.
-  -- Derived here so order_agg can join on state without a correlated reference.
+  -- pending: one row per unshipped order with all address fields resolved.
+  -- The dateShipped IS NULL filter lives here so the outer query is a clean
+  -- FROM ... LEFT JOIN chain with no intervening WHERE clause.
   SELECT
     o.id                                          AS order_id,
     o.datePlaced                                  AS order_date,
-    o.dateShipped                                 AS shipping_date,
-    ci.state,
+    c.id                                          AS customer_id,
     CONCAT(c.firstName, ' ', c.lastName)          AS customer_name,
     CASE
       WHEN c.address2 IS NULL OR TRIM(c.address2) = '' THEN c.address1
@@ -207,64 +215,25 @@ FROM (
   FROM `Order`   o
   JOIN Customer  c  ON o.customer_id = c.id
   JOIN City      ci ON c.zip         = ci.zip
-) AS ship_info
+  WHERE o.dateShipped IS NULL
+) AS pending
 LEFT JOIN (
-  -- order_agg: one row per state containing all order objects for that state.
+  -- item_agg: pull list for each order — what the picker needs to stage.
   SELECT
-    si.state,
+    ol.order_id,
     JSON_ARRAYAGG(
       JSON_OBJECT(
-        'OrderID',      si.order_id,
-        'OrderDate',    si.order_date,
-        'ShippingDate', si.shipping_date,
-        'ShipTo', JSON_OBJECT(
-          'CustomerName',   si.customer_name,
-          'address_line_1', si.address_line_1,
-          'address_line_2', si.address_line_2
-        ),
-        'furniture_items', COALESCE(item_agg.item_list, JSON_ARRAY())
+        'ProductID',   p.id,
+        'ProductName', p.name,
+        'Quantity',    ol.quantity
       )
-      ORDER BY si.order_id
-    ) AS order_list
-  FROM (
-    -- Repeat the same ship_info derivation so order_agg has its own scope.
-    -- MariaDB does not allow a derived table in the outer FROM to be referenced
-    -- inside a LEFT JOIN subquery, so we define it again here.
-    SELECT
-      o.id                                          AS order_id,
-      o.datePlaced                                  AS order_date,
-      o.dateShipped                                 AS shipping_date,
-      ci.state,
-      CONCAT(c.firstName, ' ', c.lastName)          AS customer_name,
-      CASE
-        WHEN c.address2 IS NULL OR TRIM(c.address2) = '' THEN c.address1
-        ELSE CONCAT(c.address1, ' #', c.address2)
-      END                                           AS address_line_1,
-      CONCAT(ci.city, ', ', ci.state, '   ', LPAD(ci.zip, 5, '0'))
-                                                    AS address_line_2
-    FROM `Order`   o
-    JOIN Customer  c  ON o.customer_id = c.id
-    JOIN City      ci ON c.zip         = ci.zip
-  ) AS si
-  LEFT JOIN (
-    -- item_agg: furniture items array per order.
-    SELECT
-      ol.order_id,
-      JSON_ARRAYAGG(
-        JSON_OBJECT(
-          'ProductID',   p.id,
-          'ProductName', p.name,
-          'Quantity',    ol.quantity
-        )
-      ) AS item_list
-    FROM Orderline ol
-    JOIN Product   p ON ol.product_id = p.id
-    GROUP BY ol.order_id
-  ) AS item_agg ON item_agg.order_id = si.order_id
-  GROUP BY si.state
-) AS order_agg ON order_agg.state = ship_info.state
-GROUP BY ship_info.state, order_agg.order_list
-ORDER BY ship_info.state
+      ORDER BY p.id
+    ) AS pull_list
+  FROM Orderline ol
+  JOIN Product   p ON ol.product_id = p.id
+  GROUP BY ol.order_id
+) AS item_agg ON item_agg.order_id = pending.order_id
+ORDER BY pending.order_date ASC   -- oldest orders ship first
 INTO OUTFILE '/var/lib/mysql-files/custom1.json'
 LINES TERMINATED BY '\n';
 
